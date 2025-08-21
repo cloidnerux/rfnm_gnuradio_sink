@@ -1,0 +1,35 @@
+# Ignore build directories
+/Debug/
+
+# Ignore common C++ compiled files
+*.o
+*.obj
+*.so
+*.a
+*.out
+*.exe
+*.dll
+*.elf
+
+# Ignore backup/editor files
+*~
+*.swp
+.DS_Store
+
+# Ignore CMake build files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Ignore Visual Studio files (if applicable)
+.vscode/
+*.vcxproj*
+*.sln
+*.user
+*.filters
+*.ncb
+*.opensdf
+*.sdf
+ipch/
