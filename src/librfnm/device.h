@@ -193,6 +193,9 @@ namespace rfnm {
         MSDLL rfnm_api_failcode tx_dqbuf(struct tx_buf** buf);
         MSDLL rfnm_api_failcode set_tx_channel_status(uint32_t channel, enum rfnm_ch_enable enable, enum rfnm_ch_stream stream, bool apply = false);
 
+        //Directly queue buffer to LA9310
+        MSDLL rfnm_api_failcode queueBuffer(struct rfnm_tx_usb_buf* ltxbuf);
+
         // RF path (antenna) name conversion
         MSDLL static enum rfnm_rf_path string_to_rf_path(std::string path);
         MSDLL static std::string rf_path_to_string(enum rfnm_rf_path path);
@@ -243,6 +246,8 @@ namespace rfnm {
 
         _usb_handle *usb_handle = nullptr;
         int rfnm_ctrl_ep_ioctl;
+        //Internal file descripter for the ep file
+        int data_ep_fp;
 
         std::string rfnm_eth_transport_ip_addr;
 

@@ -31,21 +31,25 @@ namespace gr {
       float samp_rate_;
       //rfnmConfig rfnm;
       rfnm::device * rfnmDevice;
-      std::queue<struct rfnm::tx_buf*> ltxqueue;
       int dequed;
       std::chrono::time_point<std::chrono::high_resolution_clock> tstart;
       size_t inbufsize;
 	  uint8_t bytes_per_ele;
-	  //uint8_t* s[NBUF];
-	  struct rfnm::tx_buf txbuf[NBUF];
+	  //Ring buffer of tx buffers
+	  struct rfnm_tx_usb_buf * txbufs[NBUF];
+	  //Ring buffer of data buffers
 	  uint8_t * txBufferTrack[NBUF];
 
 	  uint32_t bufFillIndex;
 	  uint32_t bufRotationIndex;
+	  uint32_t elementsPerBuffer;
+	  float dScale;
+	  uint64_t packetCounter;
+	  int retryCount;
 
      public:
       void set_freq(float);
-      rfnm_sink_impl(float samp_rate, float carrier_freq);
+      rfnm_sink_impl(float samp_rate, float carrier_freq, float scale, uint16_t power);
       ~rfnm_sink_impl();
 
       // Where all the action really happens
@@ -54,6 +58,8 @@ namespace gr {
               gr_vector_const_void_star &input_items,
               gr_vector_void_star &output_items
       );
+     protected:
+     void convert_and_pack_complex_float_to_int12(const float* src, uint8_t* dst, int count, float scale);
     };
 
   } // namespace rfnm

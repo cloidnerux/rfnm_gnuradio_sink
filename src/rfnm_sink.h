@@ -41,7 +41,7 @@ namespace gr {
        * class. rfnm::rfnm_sink::make is the public interface for
        * creating new instances.
        */
-	static sptr make(float samp_rate, float carrier_freq);
+	static sptr make(float samp_rate, float carrier_freq, float scale, uint16_t power);
 	virtual void set_freq(float)=0;
     };
 

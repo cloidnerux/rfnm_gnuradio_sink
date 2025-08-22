@@ -126,14 +126,14 @@ int main(){
 	//Convert to 12-bit
 	//16383
 	//32767
-	typeConverter = gr::blocks::complex_to_interleaved_short::make(true, 20000);
+	//typeConverter = gr::blocks::complex_to_interleaved_short::make(true, 20000);
 
 	//double      freq_hz = conf.rf_freq * (1000000.0 - conf.ppm) / 1000000.0;
 	//double      rate_hz = (2.0 * conf.sym_rate) * ((1000000.0 - conf.ppm) / 1000000.0);
 
 	try
 	{
-		rfnmSink = gr::grRFNM::rfnm_sink::make(SYM_RATE, CARRIER_FREQ);
+		rfnmSink = gr::grRFNM::rfnm_sink::make(SYM_RATE, CARRIER_FREQ, 1250, 40);
 	}
 	catch (std::runtime_error &e)
 	{
@@ -155,8 +155,8 @@ int main(){
 	tb->connect(modulator, 0, pl_framer, 0);
 	//tb->connect(pl_framer, 0, typeConverter, 0);
 	tb->connect(pl_framer, 0, filter, 0);
-	tb->connect(filter, 0, typeConverter, 0);
-	tb->connect(typeConverter, 0, rfnmSink, 0);
+	//tb->connect(filter, 0, typeConverter, 0);
+	tb->connect(filter, 0, rfnmSink, 0);
 
 	/*if (conf.probe)
 	{

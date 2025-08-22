@@ -223,7 +223,11 @@ MSDLL device::device(enum transport transport, std::string address, enum debug_l
             thread_c[i] = std::thread(&device::threadfn, this, i);
         }
 
-
+		data_ep_fp = open("/dev/rfnm_data_ep", O_RDWR);
+		if (data_ep_fp < 0) {
+			spdlog::error("Couldn't open /dev/rfnm_data_ep");
+			return;
+		}
         // Success
         return;
 
@@ -1037,6 +1041,36 @@ void device::threadfn(size_t thread_index) {
 }
 
 
+// This function is extracted from the worker thread
+// We directly poll the data device and put in our own buffers
+// This way we avoid the additional overhead and threads
+MSDLL rfnm_api_failcode device::queueBuffer(struct rfnm_tx_usb_buf* ltxbuf){
+	struct pollfd pfd;
+	pfd.fd = data_ep_fp;
+	pfd.events = POLLOUT;
+	// poll is a blocking call
+	// it will wait for the device to respond or the timeout
+	int ret = poll(&pfd, 1, /* timeout_ms= */ 5);
+	if (ret < 0) {
+		spdlog::error("Error polling /dev/rfnm_ep_data device!");
+		return RFNM_API_TIMEOUT;
+	}
+	else if (ret == 0) {
+
+		spdlog::error("tx pool timeout");
+
+		return RFNM_API_TX_POOL_TIMEOUT;
+
+	}
+	else if (pfd.revents & POLLOUT) {
+		// safe to call TX ioctl once
+		if (ioctl(data_ep_fp, RFNM_IOCTL_BASE_DATA | 0, (uint8_t*)ltxbuf) < 0) {
+			spdlog::error("TX queue error");
+			return RFNM_API_TX_POOL_TIMEOUT;
+		}
+	}
+	return RFNM_API_OK;
+}
 
 
 MSDLL std::vector<struct rfnm_dev_hwinfo> device::find(enum transport transport, std::string address, int bind) {

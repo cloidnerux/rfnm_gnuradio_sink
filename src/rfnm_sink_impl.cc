@@ -20,6 +20,8 @@
 #include <queue>
 #include <chrono>
 #include <spdlog/spdlog.h>
+#include <arm_neon.h>
+#include <stdint.h>
 
 #include "librfnm/device.h"
 #include "librfnm/constants.h"
@@ -34,20 +36,23 @@ namespace gr {
   namespace grRFNM {
 
     rfnm_sink::sptr
-	rfnm_sink::make(float samp_rate, float carrier_freq) {
-    	return gnuradio::get_initial_sptr(new rfnm_sink_impl(samp_rate, carrier_freq));
+	rfnm_sink::make(float samp_rate, float carrier_freq, float scale, uint16_t power) {
+    	return gnuradio::get_initial_sptr(new rfnm_sink_impl(samp_rate, carrier_freq, scale, power));
     }
 
     /*
      * The private constructor
      */
-    rfnm_sink_impl::rfnm_sink_impl(float samp_rate, float carrier_freq) :
-    		gr::sync_block("rfnm_sink",  gr::io_signature::make(1, 1, sizeof(int16_t) * 2), gr::io_signature::make(0, 0, 0))
+    rfnm_sink_impl::rfnm_sink_impl(float samp_rate, float carrier_freq, float scale, uint16_t power) :
+    		gr::sync_block("rfnm_sink",  gr::io_signature::make(1, 1, sizeof(gr_complex)), gr::io_signature::make(0, 0, 0))
     {
 		//TODO: Create necessary structures here
     	bufFillIndex = 0;
     	bufRotationIndex = 0;
-        samp_rate_=samp_rate;
+        samp_rate_= samp_rate;
+        dScale = scale;
+        packetCounter = 0;
+        retryCount = 0;
         pthread_mutex_init(&th, NULL);
         //Magic values from example
         //uint32_t ddrBufSize, uint32_t dataChunkWidth
@@ -63,7 +68,7 @@ namespace gr {
         rfnmDevice->set_tx_channel_status(tx_ch.id, RFNM_CH_RF_ON, RFNM_CH_STREAM_ON);
         rfnmDevice->set_tx_channel_path(tx_ch.id, RFNM_PATH_SMA_A);	//RFNM_PATH_EMBED_ANT
         rfnmDevice->set_tx_channel_rfic_lpf_bw(tx_ch.id, int(2*samp_rate/1e6));
-        rfnmDevice->set_tx_channel_power(tx_ch.id, 40);
+        rfnmDevice->set_tx_channel_power(tx_ch.id, power);
         rfnmDevice->set_tx_channel_freq(tx_ch.id, RFNM_MHZ_TO_HZ((int)(carrier_freq / 1e6)));
 
         if (auto lret = rfnmDevice->apply(tx_ch.apply)) {
@@ -74,24 +79,34 @@ namespace gr {
 
 
         this->rfnmDevice->set_stream_format(rfnm::STREAM_FORMAT_CS16, &inbufsize, &bytes_per_ele);
+        elementsPerBuffer = inbufsize / bytes_per_ele;
+        // inbufsize is the size of the buffer containing the CS16 samples
+        // Therefore it is NUM_ELEMENTS * 4 bytes for CS16
         spdlog::info("bufsize: {}, {} bytes per element", inbufsize, bytes_per_ele);
-        this->dequed = 0;
+
         // Allocate and prepare buffers
 	    for (int i = 0; i < NBUF; ++i) {
-		    txbuf[i].buf = (uint8_t*)malloc(inbufsize);
-		    txBufferTrack[i] = txbuf[i].buf; 	//Ensure we can track the allocated buffers
-		    memset(txbuf[i].buf, 0, inbufsize);
-		    ltxqueue.push(&txbuf[i]);
+	    	//txbufs are the ring buffers for the PCIe streaming. The struct contains hard coded buffer sizes
+		    txbufs[i] = (struct rfnm_tx_usb_buf*)malloc(sizeof(struct rfnm_tx_usb_buf));
+		    txbufs[i]->magic = 0x758f4d4a;
+		    txbufs[i]->dac_cc = 0;
+		    txbufs[i]->dac_id = 0;
+		    txbufs[i]->dropped = 0;
+		    txbufs[i]->padding[0] = 0;
+		    txbufs[i]->phytimer = 0;
+		    txbufs[i]->usb_cc = 0;
+		    //These buffers are for the incoming data
+		    //txBufferTrack[i] = (uint8_t*)malloc(inbufsize); 	//Ensure we can track the allocated buffers
+		    //memset(txBufferTrack[i], 0, inbufsize);
 	    }
+	    dequed = 0;
 	    //TX_LATENCY_POLICY_AGGRESSIVE
 	    //TX_LATENCY_POLICY_DEFAULT
-        rfnmDevice->tx_work_start(rfnm::TX_LATENCY_POLICY_RELAXED); //TX_LATENCY_POLICY_RELAXED
+	    //We queue the buffer directly, no need for the threads
+        //rfnmDevice->tx_work_start(rfnm::TX_LATENCY_POLICY_RELAXED); //TX_LATENCY_POLICY_RELAXED
         this->tstart = std::chrono::high_resolution_clock::now();
 
-        spdlog::info("Initialized RFNM Sink with carrier freq {} Hz and sample rate {} and num buffers: {}", carrier_freq, samp_rate, ltxqueue.size());
-        if (ltxqueue.empty()) {
-        	spdlog::warn("For whatever reason ltxqueue is empty!");
-        }
+        spdlog::info("Initialized RFNM Sink with carrier freq {} Hz and sample rate {} and num power: {}", carrier_freq, samp_rate, power);
     }
 
     /*
@@ -101,10 +116,6 @@ namespace gr {
     	//TODO: Delete created structures here
     	rfnmDevice->tx_work_stop();
     	delete rfnmDevice;
-    	while(!ltxqueue.empty()){
-    		auto first_txbuf = ltxqueue.front();
-    		ltxqueue.pop();
-    	}
     	for(int i = 0; i < NBUF; i++){
     		free(txBufferTrack[i]);
     	}
@@ -123,78 +134,41 @@ namespace gr {
     }
 
     int rfnm_sink_impl::work(int noutput_items, gr_vector_const_void_star &input_items, gr_vector_void_star &output_items)    {
-    	const int16_t* in = (const int16_t*)input_items[0]; // Already CS16: [I0, Q0, I1, Q1, ...]
+    	const float* in = (const float*)input_items[0]; // Already CS16: [I0, Q0, I1, Q1, ...]
 		uint32_t bytes_copied = 0;
 		uint32_t samples_to_copy = noutput_items;
 		pthread_mutex_lock(&th);
-		struct rfnm::tx_buf* txbuf = nullptr;
-		struct rfnm::tx_buf* donebuf = nullptr;
-		if (ltxqueue.empty()) {
-			//pthread_mutex_unlock(&th);
-			//spdlog::error("No available TX buffer, wait for dequeue! In number of elements: {}", noutput_items);
-			// Wait for a buffer to complete and retrieve it
-			while (rfnmDevice->tx_dqbuf(&donebuf) != RFNM_API_OK) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_FOR_EMPTY_BUFFER_MS));
-			}
-			donebuf->buf = txBufferTrack[bufRotationIndex++];
-			if(bufRotationIndex >= NBUF){
-				bufRotationIndex = 0;
-			}
-			ltxqueue.push(donebuf);
-			//We now have at least one free buffer
-		}
-		auto first_txbuf = ltxqueue.front();
 
+		//First do some buffer management. Copy the incoming samples in the currently free buffer while checking the fill
+		//bufFillIndex is in number of items in the buffer
 		do {
-			if((bufFillIndex + samples_to_copy * BYTES_PER_CS16) >= inbufsize){
-				//We will fill this buffer and maybe more
-				uint32_t remainder = inbufsize - bufFillIndex;
-				//Copy data and send buffer
-				memcpy(first_txbuf->buf+bufFillIndex, in+bytes_copied, remainder);
-				samples_to_copy -= remainder / BYTES_PER_CS16;	//This counter is in elements, not in bytes
-				bytes_copied += remainder;
-				if (rfnmDevice->tx_qbuf(first_txbuf) == RFNM_API_OK) {
-					dequed++;
-				} else {
-					//Technically without an exception this code cannot be reached
-					ltxqueue.push(first_txbuf); // Requeue on failure
-					spdlog::error("Could not queue buffer!");
-					return samples_to_copy;
+			if((bufFillIndex + samples_to_copy) >= elementsPerBuffer) {
+				//We will fill this buffer
+				convert_and_pack_complex_float_to_int12(in, &txbufs[bufRotationIndex]->buf[bufFillIndex*3], elementsPerBuffer-(bufFillIndex + samples_to_copy), dScale);
+				txbufs[bufRotationIndex]->usb_cc = packetCounter++;
+				while(rfnmDevice->queueBuffer(txbufs[bufRotationIndex++]) != RFNM_API_OK){
+					std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_FOR_EMPTY_BUFFER_MS));
+					retryCount++;
+					if(retryCount == 3){
+						spdlog::error("Could not queue buffer to LA9310!");
+						retryCount = 0;
+						break;
+					}
 				}
+				if(bufRotationIndex >= NBUF){
+					bufRotationIndex = 0;
+				}
+				samples_to_copy -= elementsPerBuffer-(bufFillIndex + samples_to_copy);
 				bufFillIndex = 0;
-				ltxqueue.pop();
-				if (ltxqueue.empty()) {
-					//pthread_mutex_unlock(&th);
-					//spdlog::warn("No available TX buffer for data transfer, wait for deque!");
-					// Dequeue completed TX buffers
-					while (rfnmDevice->tx_dqbuf(&donebuf) != RFNM_API_OK) {
-						std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_FOR_EMPTY_BUFFER_MS));
-					}
-					donebuf->buf = txBufferTrack[bufRotationIndex++];
-					if(bufRotationIndex >= NBUF){
-						bufRotationIndex = 0;
-					}
-					ltxqueue.push(donebuf);
-					//was return
-				}
-				first_txbuf = ltxqueue.front();
-			} else {
-				//We wont fill this buffer
-				memcpy(first_txbuf->buf+bufFillIndex, in+bytes_copied, samples_to_copy * BYTES_PER_CS16);
-				bufFillIndex += samples_to_copy * BYTES_PER_CS16;
-				bytes_copied += samples_to_copy * BYTES_PER_CS16;
-				samples_to_copy = 0;
-			}
-		} while(samples_to_copy > 0);
 
-		// Dequeue completed TX buffers
-		while(rfnmDevice->tx_dqbuf(&donebuf) == RFNM_API_OK) {
-			donebuf->buf = txBufferTrack[bufRotationIndex++];
-			if(bufRotationIndex >= NBUF){
-				bufRotationIndex = 0;
+			} else {
+				//Not enough elements to fill the buffer, just copy the data
+				//We need 3 byte per complex data point
+				convert_and_pack_complex_float_to_int12(in, &txbufs[bufRotationIndex]->buf[bufFillIndex*3], noutput_items, dScale);
+				bufFillIndex += noutput_items;
+				samples_to_copy -= noutput_items;
 			}
-			ltxqueue.push(donebuf);
-		}
+		}while(samples_to_copy > 0);
 
 		// Optional: Print TX stats
 		auto tnow = std::chrono::high_resolution_clock::now();
@@ -210,5 +184,113 @@ namespace gr {
 
 		return noutput_items; // We consumed these many input items
     }
+
+    static inline int16_t float_to_int12_saturate(float x, float scale) {
+        int32_t scaled = (int32_t)roundf(x * scale);
+        if (scaled > 2047) return 2047;
+        if (scaled < -2048) return -2048;
+        return (int16_t)scaled;
+    }
+
+    //Straight from chatgpt
+    //The gnuradio block sues volk
+    //https://github.com/gnuradio/gnuradio/blob/main/gr-blocks/lib/complex_to_interleaved_short_impl.cc
+    //volk_32f_s32f_convert_16i
+    void rfnm_sink_impl::convert_and_pack_complex_float_to_int12(const float* src, uint8_t* dst, int count, float scale) {
+        int i = 0;
+
+        for (; i <= count - 4; i += 4) {
+            // Load 4 complex values (8 floats)
+            float32x4x2_t complex = vld2q_f32(src + 2 * i);
+
+            float32x4_t scaled_real = vmulq_n_f32(complex.val[0], scale);
+            float32x4_t scaled_imag = vmulq_n_f32(complex.val[1], scale);
+
+            // Convert to int32
+            int32x4_t real_i32 = vcvtq_s32_f32(scaled_real);
+            int32x4_t imag_i32 = vcvtq_s32_f32(scaled_imag);
+
+            // Signed saturating extract Narrow, half the width of the integer
+            int16x4_t real_i16 = vqmovn_s32(real_i32);
+            int16x4_t imag_i16 = vqmovn_s32(imag_i32);
+
+            // Store multiple single-element structures from one, two, three, or four registers.
+            int16_t real_vals[4], imag_vals[4];
+            vst1_s16(real_vals, real_i16);
+            vst1_s16(imag_vals, imag_i16);
+
+            // Scalar packing to 12-bit
+            for (int j = 0; j < 4; ++j) {
+                int16_t real = real_vals[j];
+                int16_t imag = imag_vals[j];
+
+                // Clamp to 12-bit
+                //real = real > 2047 ? 2047 : (real < -2048 ? -2048 : real);
+                //imag = imag > 2047 ? 2047 : (imag < -2048 ? -2048 : imag);
+
+                // Convert to unsigned 12-bit two's complement
+                //uint16_t real_u = (uint16_t)(real & 0x0FFF);
+                //uint16_t imag_u = (uint16_t)(imag & 0x0FFF);
+
+                // Pack into 3 bytes
+                dst[0] = real & 0xFF;
+                dst[1] = ((real >> 8) & 0x0F) | ((imag & 0x0F) << 4);
+                dst[2] = (imag >> 4) & 0xFF;
+
+                dst += 3;
+            }
+        }
+
+        // Tail processing
+        for (; i < count; ++i) {
+            int16_t real = float_to_int12_saturate(src[2 * i], scale);
+            int16_t imag = float_to_int12_saturate(src[2 * i + 1], scale);
+
+            uint16_t r = (uint16_t)(real & 0x0FFF);
+            uint16_t im = (uint16_t)(imag & 0x0FFF);
+
+            dst[0] = r & 0xFF;
+            dst[1] = ((r >> 8) & 0x0F) | ((im & 0x0F) << 4);
+            dst[2] = (im >> 4) & 0xFF;
+            dst += 3;
+        }
+    }
+    /*void rfnm_sink_impl::convert_complex_float_to_int16_neon(const float* src, int16_t* dst, int count, float scale) {
+        int i = 0;
+        float32x4_t scale_vec = vdupq_n_f32(scale);  // Load scale to SIMD
+
+        for (; i <= count - 4; i += 4) {
+            // Load 4 complex values = 8 float32
+            float32x4x2_t complex = vld2q_f32(src + 2 * i);  // Deinterleaves to real/imag
+
+            // Scale both real and imag
+            float32x4_t real_scaled = vmulq_f32(complex.val[0], scale_vec);
+            float32x4_t imag_scaled = vmulq_f32(complex.val[1], scale_vec);
+
+            // Convert to int16 with saturation
+            int16x4_t real_i16 = vqmovn_s32(vcvtq_s32_f32(real_scaled));
+            int16x4_t imag_i16 = vqmovn_s32(vcvtq_s32_f32(imag_scaled));
+
+            // Interleave back
+            int16x4x2_t result;
+            result.val[0] = real_i16;
+            result.val[1] = imag_i16;
+
+            // Store 8 int16_t (4 complex) interleaved
+            vst2_s16(dst + 2 * i, result);
+        }
+
+        // Fallback for remaining elements (if count not divisible by 4)
+        for (; i < count; i++) {
+            float real = src[2 * i] * scale;
+            float imag = src[2 * i + 1] * scale;
+
+            int16_t r = (int16_t)(real > 32767.0f ? 32767.0f : (real < -32768.0f ? -32768.0f : real));
+            int16_t im = (int16_t)(imag > 32767.0f ? 32767.0f : (imag < -32768.0f ? -32768.0f : imag));
+
+            dst[2 * i] = r;
+            dst[2 * i + 1] = im;
+        }
+    }*/
   }
 }
