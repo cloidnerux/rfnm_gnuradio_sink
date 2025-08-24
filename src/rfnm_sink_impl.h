@@ -38,7 +38,7 @@ namespace gr {
 	  //Ring buffer of tx buffers
 	  struct rfnm_tx_usb_buf * txbufs[NBUF];
 	  //Ring buffer of data buffers
-	  uint8_t * txBufferTrack[NBUF];
+	  //uint8_t * txBufferTrack[NBUF];
 
 	  uint32_t bufFillIndex;
 	  uint32_t bufRotationIndex;

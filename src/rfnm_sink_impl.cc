@@ -85,7 +85,7 @@ namespace gr {
         spdlog::info("bufsize: {}, {} bytes per element", inbufsize, bytes_per_ele);
 
         // Allocate and prepare buffers
-	    for (int i = 0; i < NBUF; ++i) {
+	    for (int i = 0; i < NBUF; i++) {
 	    	//txbufs are the ring buffers for the PCIe streaming. The struct contains hard coded buffer sizes
 		    txbufs[i] = (struct rfnm_tx_usb_buf*)malloc(sizeof(struct rfnm_tx_usb_buf));
 		    txbufs[i]->magic = 0x758f4d4a;
@@ -117,7 +117,7 @@ namespace gr {
     	rfnmDevice->tx_work_stop();
     	delete rfnmDevice;
     	for(int i = 0; i < NBUF; i++){
-    		free(txBufferTrack[i]);
+    		free(txbufs[i]);
     	}
     	pthread_mutex_destroy(&th);
     }
@@ -134,9 +134,11 @@ namespace gr {
     }
 
     int rfnm_sink_impl::work(int noutput_items, gr_vector_const_void_star &input_items, gr_vector_void_star &output_items)    {
-    	const float* in = (const float*)input_items[0]; // Already CS16: [I0, Q0, I1, Q1, ...]
+    	const float* in = (const float*)input_items[0]; //Interleaved complex float
 		uint32_t bytes_copied = 0;
+		//We have noutput_items complex values, hence two floats per noutput_item
 		uint32_t samples_to_copy = noutput_items;
+		uint32_t samples_copied = 0;
 		pthread_mutex_lock(&th);
 
 		//First do some buffer management. Copy the incoming samples in the currently free buffer while checking the fill
@@ -144,9 +146,9 @@ namespace gr {
 		do {
 			if((bufFillIndex + samples_to_copy) >= elementsPerBuffer) {
 				//We will fill this buffer
-				convert_and_pack_complex_float_to_int12(in, &txbufs[bufRotationIndex]->buf[bufFillIndex*3], elementsPerBuffer-(bufFillIndex + samples_to_copy), dScale);
+				convert_and_pack_complex_float_to_int12(&in[samples_copied*2], &txbufs[bufRotationIndex]->buf[bufFillIndex*3], elementsPerBuffer-bufFillIndex, dScale);
 				txbufs[bufRotationIndex]->usb_cc = packetCounter++;
-				while(rfnmDevice->queueBuffer(txbufs[bufRotationIndex++]) != RFNM_API_OK){
+				while(rfnmDevice->queueBuffer(txbufs[bufRotationIndex]) != RFNM_API_OK){
 					std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_FOR_EMPTY_BUFFER_MS));
 					retryCount++;
 					if(retryCount == 3){
@@ -155,30 +157,39 @@ namespace gr {
 						break;
 					}
 				}
+				dequed++;
+				bufRotationIndex++;
 				if(bufRotationIndex >= NBUF){
 					bufRotationIndex = 0;
 				}
-				samples_to_copy -= elementsPerBuffer-(bufFillIndex + samples_to_copy);
+				samples_copied += (elementsPerBuffer-bufFillIndex);
+				samples_to_copy -= (elementsPerBuffer-bufFillIndex);
 				bufFillIndex = 0;
 
 			} else {
 				//Not enough elements to fill the buffer, just copy the data
 				//We need 3 byte per complex data point
-				convert_and_pack_complex_float_to_int12(in, &txbufs[bufRotationIndex]->buf[bufFillIndex*3], noutput_items, dScale);
-				bufFillIndex += noutput_items;
-				samples_to_copy -= noutput_items;
+				convert_and_pack_complex_float_to_int12(&in[samples_copied*2], &txbufs[bufRotationIndex]->buf[bufFillIndex*3], samples_to_copy, dScale);
+				bufFillIndex += samples_to_copy;
+				samples_copied += samples_to_copy;
+				samples_to_copy = 0;
+			}
+			if(samples_to_copy > noutput_items){
+				spdlog::error("Something went horribly wrong and we got buffer overflows!");
+				spdlog::warn("stc {}, n {}, epb {}, bfi {}, bri {}", samples_to_copy, noutput_items, elementsPerBuffer, bufFillIndex, bufRotationIndex);
+				break;
 			}
 		}while(samples_to_copy > 0);
 
 		// Optional: Print TX stats
-		auto tnow = std::chrono::high_resolution_clock::now();
+		/*auto tnow = std::chrono::high_resolution_clock::now();
 		auto ms_int = std::chrono::duration_cast<std::chrono::milliseconds>(tnow - tstart);
 		if (ms_int.count() > 1000) {
 			float sps = (inbufsize * dequed / 4.0f);
 			spdlog::info("TX Rate: {} Msps, {} Mbps, nelements {}, inbufsize {}, bufFillIndex {}", sps / 1e6, (sps * 24) / 1e6, noutput_items, inbufsize, bufFillIndex);
 			dequed = 0;
 			tstart = tnow;
-		}
+		}*/
 
 		pthread_mutex_unlock(&th);
 
@@ -198,6 +209,7 @@ namespace gr {
     //volk_32f_s32f_convert_16i
     void rfnm_sink_impl::convert_and_pack_complex_float_to_int12(const float* src, uint8_t* dst, int count, float scale) {
         int i = 0;
+        //uint8_t * tmp = dst;
 
         for (; i <= count - 4; i += 4) {
             // Load 4 complex values (8 floats)
@@ -254,6 +266,7 @@ namespace gr {
             dst[2] = (im >> 4) & 0xFF;
             dst += 3;
         }
+        //spdlog::info("Buffer diff: {}", dst - tmp);
     }
     /*void rfnm_sink_impl::convert_complex_float_to_int16_neon(const float* src, int16_t* dst, int count, float scale) {
         int i = 0;
